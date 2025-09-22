@@ -1,0 +1,8 @@
+export KAFKA_BOOTSTRAP="broker1:9092,broker2:9092"
+export INPUT_TOPICS="raw-input"
+export ERRORS_TOPIC="errors"
+export REGISTRY_COMPAT_URL="http://apicurio:8080/apis/ccompat/v6"
+export SCHEMA_SUBJECT="raw-input-value"   # subject ридер-схемы
+export PHONE_FIELD="phone"
+export ROUTING_RULES_JSON='{"^\\+7\\d{10}$":"ru",".*":"rest"}'
+export CHECKPOINT_LOCATION="/data/checkpoints/basic-avro-router"
