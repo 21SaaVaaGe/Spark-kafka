@@ -1,4 +1,4 @@
-# PySpark 3.3+ (желательно 3.5)
+# PySpark 3.3+ (лучше 3.5.x)
 # Запуск:
 # spark-submit \
 #   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.apache.spark:spark-avro_2.12:3.5.1 \
@@ -9,7 +9,7 @@ from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.sql.avro.functions import from_avro
 
 # -----------------------------
-# Конфигурация (ENV)
+# Конфигурация
 # -----------------------------
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 INPUT_TOPICS    = os.getenv("INPUT_TOPICS", "raw-input").split(",")
@@ -18,43 +18,56 @@ ROUTE_TOPIC_PREFIX = os.getenv("ROUTE_TOPIC_PREFIX", "route")
 
 # Apicurio (Confluent-compatible API, напр. http://apicurio:8080/apis/ccompat/v6)
 REGISTRY_COMPAT_URL = os.getenv("REGISTRY_COMPAT_URL", "http://apicurio:8080/apis/ccompat/v6")
-# Subject для ридер-схемы (обычно <topic>-value). Берём latest версию.
 SCHEMA_SUBJECT = os.getenv("SCHEMA_SUBJECT", "raw-input-value")
 
-PHONE_FIELD = os.getenv("PHONE_FIELD", "phone")
+# Альтернатива без сети: положить схему прямо сюда
+READER_SCHEMA_STR = os.getenv("READER_SCHEMA_STR", "")              # строка JSON Avro
+READER_SCHEMA_FILE = os.getenv("READER_SCHEMA_FILE", "")            # путь к файлу со схемой
 
-# JSON вида: {"^\\+7\\d{10}$":"ru","^\\+380\\d{9}$":"ua",".*":"rest"}
+PHONE_FIELD = os.getenv("PHONE_FIELD", "phone")
 ROUTING_RULES = json.loads(os.getenv("ROUTING_RULES_JSON", '{"^\\+7\\d{10}$":"ru",".*":"rest"}'))
 
 CHECKPOINT_LOCATION = os.getenv("CHECKPOINT_LOCATION", "/tmp/ckp/stream-basic-avro-router")
-STARTING_OFFSETS = os.getenv("STARTING_OFFSETS", "latest")  # либо "earliest"
+STARTING_OFFSETS = os.getenv("STARTING_OFFSETS", "latest")  # "earliest" при необходимости
 OUTPUT_KAFKA_ACKS = os.getenv("OUTPUT_KAFKA_ACKS", "all")
 
 # -----------------------------
-# Инициализация Spark
+# Spark
 # -----------------------------
 spark = (
     SparkSession.builder
     .appName("basic-kafka-avro-router")
     .config("spark.sql.shuffle.partitions", "200")
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
 
 # -----------------------------
-# Достаём ридер-схему из Apicurio (один раз, stdlib)
+# Резолв ридер-схемы (локально > файл > Apicurio)
 # -----------------------------
-def fetch_latest_reader_schema(compat_base_url: str, subject: str) -> str:
-    url = compat_base_url.rstrip("/") + f"/subjects/{subject}/versions/latest"
+def resolve_reader_schema() -> str:
+    # 1) из переменной
+    if READER_SCHEMA_STR.strip():
+        # валидация как JSON
+        json.loads(READER_SCHEMA_STR)
+        return READER_SCHEMA_STR
+    # 2) из файла
+    if READER_SCHEMA_FILE.strip():
+        with open(READER_SCHEMA_FILE, "r", encoding="utf-8") as f:
+            text = f.read()
+        json.loads(text)
+        return text
+    # 3) Apicurio (внутренняя сеть)
+    url = REGISTRY_COMPAT_URL.rstrip("/") + f"/subjects/{SCHEMA_SUBJECT}/versions/latest"
     with urllib.request.urlopen(url, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-        # ответ формата {"subject": "...", "version": N, "schema": "<JSON string>"}
         return data["schema"]
 
-READER_SCHEMA_STR = fetch_latest_reader_schema(REGISTRY_COMPAT_URL, SCHEMA_SUBJECT)
+READER_AVRO_SCHEMA = resolve_reader_schema()
 
 # -----------------------------
-# UDF: снять wire-заголовок, вернуть payload/schema_id/ошибку
+# UDF: снять confluent wire header (0x00 + 4 байта schema id)
 # -----------------------------
 WireInfoType = T.StructType([
     T.StructField("payload",   T.BinaryType(), True),
@@ -63,23 +76,21 @@ WireInfoType = T.StructType([
 ])
 
 @F.udf(WireInfoType)
-def extract_wire_info(value: bytes):
+def extract_wire_info(v: bytes):
     try:
-        if value is None or len(value) == 0:
+        if v is None or len(v) == 0:
             return (None, None, "empty_value")
-        b0 = value[0]
-        if b0 == 0 and len(value) >= 5:
-            # Confluent wire format: 0x00 + 4 bytes schema id + avro
-            sid = int.from_bytes(value[1:5], byteorder="big", signed=False)
-            return (value[5:], sid, None)
-        # не wire: считаем, что весь value — это avro payload
-        return (value, None, None)
+        b0 = v[0]
+        if b0 == 0 and len(v) >= 5:
+            sid = int.from_bytes(v[1:5], byteorder="big", signed=False)
+            return (v[5:], sid, None)
+        # не-wire формат — считаем весь value полезной нагрузкой
+        return (v, None, None)
     except Exception as e:
-        # никаких исключений наружу — только текст ошибки
         return (None, None, f"wire_parse_error: {str(e)}")
 
 # -----------------------------
-# Читаем из Kafka
+# Источник: Kafka
 # -----------------------------
 src = (
     spark.readStream.format("kafka")
@@ -87,10 +98,10 @@ src = (
     .option("subscribe", ",".join(INPUT_TOPICS))
     .option("startingOffsets", STARTING_OFFSETS)
     .option("failOnDataLoss", "false")
+    .option("includeHeaders", "true")          # ВАЖНО: иначе headers может не прийти
     .load()
 )
 
-# Разбор wire-заголовка
 with_wire = src.select(
     F.col("key").alias("in_key"),
     F.col("value").alias("in_value"),
@@ -103,38 +114,33 @@ with_wire = src.select(
     F.col("wire.error").alias("wire_error")
 )
 
-# Декод Avro с ридер-схемой (Spark builtin)
+# Декод Avro «мягко»
 decoded = with_wire.select(
     "in_key", "in_value", "in_headers", "schema_id", "wire_error",
-    from_avro(F.col("payload"), READER_SCHEMA_STR, {"mode": "PERMISSIVE"}).alias("obj")
+    from_avro(F.col("payload"), READER_AVRO_SCHEMA, {"mode": "PERMISSIVE"}).alias("obj")
 )
 
 # -----------------------------
-# Маршрутизация по телефону (без UDF)
+# Роутинг по телефону (без UDF, NULL-безопасно)
 # -----------------------------
-phone_col = F.col(f"obj.{PHONE_FIELD}").cast("string")
+phone_col = F.coalesce(F.col(f"obj.{PHONE_FIELD}").cast("string"), F.lit(""))
 
-# Собираем CASE WHEN по regex-правилам
-bucket_col = None
-for pattern, bucket in ROUTING_RULES.items():
-    cond = phone_col.rlike(pattern)
-    bucket_col = F.when(cond, F.lit(bucket)) if bucket_col is None else bucket_col.when(cond, F.lit(bucket))
-# если ни одно правило не сработало — оставим null, такие уйдут в errors как «no_route»
-bucket_col = bucket_col.alias("route_bucket") if bucket_col is not None else F.lit(None).alias("route_bucket")
+# CASE ... WHEN по порядку правил
+bucket_col = F.lit(None).cast("string")
+for pattern, bucket in ROUTING_RULES.items():  # порядок сохранится
+    bucket_col = F.when(phone_col.rlike(pattern), F.lit(bucket)).otherwise(bucket_col)
+bucket_col = bucket_col.alias("route_bucket")
 
 routed = decoded.select(
-    "in_key", "in_value", "in_headers", "schema_id", "wire_error", "obj",
+    "in_key", "in_value", "in_headers", "schema_id", "wire_error",
+    "obj",
     phone_col.alias("parsed_phone"),
     bucket_col
 )
 
 # -----------------------------
-# Разделяем на валидные / ошибки
+# Классификация: ошибки / валидные
 # -----------------------------
-# Ошибка, если:
-#  - wire_error не пустой
-#  - объект не распарсился (obj IS NULL)
-#  - нет bucket (не попадает ни под одно правило)
 error_reason = (
     F.when(F.col("wire_error").isNotNull(), F.concat(F.lit("wire_error: "), F.col("wire_error")))
      .when(F.col("obj").isNull(), F.lit("from_avro_failed"))
@@ -143,7 +149,7 @@ error_reason = (
 
 errors_ds = routed.where(error_reason.isNotNull()).select(
     F.col("in_key").cast("binary").alias("key"),
-    F.col("in_value").alias("value"),  # исходный бинарный Avro как пришёл
+    F.col("in_value").alias("value"),  # исходный бинарник «как пришёл»
     F.array(
         F.struct(
             F.lit("error").cast("binary").alias("key"),
@@ -155,13 +161,13 @@ errors_ds = routed.where(error_reason.isNotNull()).select(
 
 valid_ds = routed.where(error_reason.isNull()).select(
     F.col("in_key").cast("binary").alias("key"),
-    F.col("in_value").alias("value"),         # форвардим исходный value без перекодирования
-    F.col("in_headers").alias("headers"),     # сохраняем входные headers (можно убрать)
+    F.col("in_value").alias("value"),         # форвардим ровно исходные байты
+    F.col("in_headers").alias("headers"),
     F.concat(F.lit(ROUTE_TOPIC_PREFIX + "_"), F.col("route_bucket")).alias("topic")
 )
 
 # -----------------------------
-# Запись в Kafka (два sink'а)
+# Синки: Kafka
 # -----------------------------
 def write_to_kafka(ds, checkpoint_dir):
     return (
@@ -169,6 +175,7 @@ def write_to_kafka(ds, checkpoint_dir):
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("kafka.acks", OUTPUT_KAFKA_ACKS)
+        .option("kafka.max.request.size", "10485760")  # 10MB на всякий
         .option("checkpointLocation", os.path.join(CHECKPOINT_LOCATION, checkpoint_dir))
         .outputMode("append")
         .start()
