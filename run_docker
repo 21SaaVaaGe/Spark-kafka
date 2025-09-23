@@ -1,0 +1,21 @@
+docker run --rm -it \
+  -e KAFKA_BOOTSTRAP="broker:9092" \
+  -e INPUT_TOPICS="raw-input" \
+  -e ERRORS_TOPIC="errors" \
+  -e READER_SCHEMA_FILE="/app/schemas/raw-input-value.avsc" \
+  -e MSSQL_JDBC_URL="jdbc:sqlserver://mssql:1433;databaseName=router" \
+  -e MSSQL_USER="sa" \
+  -e MSSQL_PASSWORD="yourStrong(!)Password" \
+  -e MSSQL_RULES_TABLE="dbo.routing_rules" \
+  -e MSSQL_TARGET_TABLE="dbo.matched_events" \
+  -e MINIO_ENABLE="true" \
+  -e MINIO_ENDPOINT="minio:9000" \
+  -e MINIO_ACCESS_KEY="minioadmin" \
+  -e MINIO_SECRET_KEY="minioadmin" \
+  -e MINIO_BUCKET="router-fallback" \
+  -e CHECKPOINT_LOCATION="/data/checkpoints/router" \
+  -e OTEL_ENABLE="true" \
+  -e OTEL_EXPORTER_OTLP_ENDPOINT="otel-collector:4317" \
+  -v $(pwd)/schemas:/app/schemas \
+  -v $(pwd)/checkpoints:/data/checkpoints \
+  spark-router:4.0.1
